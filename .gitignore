@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets and local caches
+.env
+data/ingestion_cache/
+data/ingestion_report.json
