@@ -26,8 +26,10 @@ COMPANY_NAMES: dict[str, str] = {
     "ORCL": "Oracle Corporation",
 }
 
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+CHAT_MODEL = "nvidia/nemotron-3.5-super-vl:free"
 EMBEDDING_MODEL = "nvidia/llama-nemotron-embed-vl-1b-v2:free"
 OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
 
-DEFAULT_PINECONE_INDEX_NAME = "financial-research"
 INGESTION_VERSION = "phase2-v1"
+DEFAULT_PINECONE_INDEX_NAME = "hebbia-ai"
