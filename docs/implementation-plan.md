@@ -33,7 +33,9 @@ Use the following technologies for the Agentic RAG development phase.
 | Agent execution | Custom Python tool-calling loop |
 | LLM generation | OpenRouter |
 | Generation model | `nvidia/nemotron-3.5-super-vl:free` |
-| Embedding model | `nvidia/llama-nemotron-embed-vl-1b-v2:free` |
+| Embedding provider | Amazon Bedrock |
+| Embedding model | `amazon.titan-embed-text-v2:0` |
+| Embedding dimensions | `1024` (Titan V2 default; also supports 256 / 512) |
 | Vector database | Pinecone |
 | Dense retrieval | Vector semantic search |
 | Sparse retrieval | BM25 |
@@ -64,7 +66,7 @@ The following restrictions apply to every agent, tool, retrieval operation and g
 
 Pinecone is the sole financial knowledge source.
 
-OpenRouter may be used for the requested embedding and LLM inference. These services process supplied inputs; they must not be used as additional financial information sources. Keep the reranker local.
+OpenRouter may be used for LLM chat / tool-calling inference only. Amazon Bedrock Titan Embed Text V2 must be used for all document and query embeddings. These services process supplied inputs; they must not be used as additional financial information sources. Keep the reranker local. Do not mix embedding models: the same Titan model and dimension must be used for ingestion and retrieval.
 
 Mem0 may store research preferences and conversation context, but it must never become a source of financial facts.
 
@@ -191,7 +193,7 @@ backend/
 │   ├── providers/
 │   │   ├── __init__.py
 │   │   ├── openrouter_chat.py
-│   │   ├── openrouter_embeddings.py
+│   │   ├── bedrock_embeddings.py
 │   │   └── local_reranker.py
 │
 ├── tests/
@@ -211,7 +213,7 @@ backend/
 | --- | --- |
 | `config.py` | Centralized AI settings and model configuration. |
 | `schemas/` | Pydantic schemas for questions, plans, evidence, financial facts and answers. |
-| `providers/` | OpenRouter model clients and local reranker initialization. |
+| `providers/` | OpenRouter chat client, Amazon Bedrock Titan embedding client, and local reranker initialization. |
 | `rag/` | Query transformation, hybrid retrieval, reranking, generation and citations. |
 | `tools/` | Internal LangChain tools exposed to the agent. |
 | `calculations/` | Deterministic financial calculations and validation. |
@@ -1713,7 +1715,7 @@ Build the complete RAG ingestion pipeline that takes the cleaned Markdown financ
 
 All eight companies must have their own dedicated Pinecone namespace so that users can select a company and retrieve information exclusively from that company's financial documents.
 
-The pipeline must use LangChain for document loading and text processing, OpenRouter for embedding generation, and Pinecone for vector storage.
+The pipeline must use LangChain for document loading and text processing, Amazon Bedrock Titan Embed Text V2 for embedding generation, and Pinecone for vector storage. Do not implement a local embedding cache or fingerprint resume layer for this paid embedding path; embed and upsert in one ingest run, using stable chunk IDs so re-runs can safely overwrite Pinecone vectors if needed.
 
 ---
 
@@ -1728,30 +1730,37 @@ Install and configure the required dependencies:
 - LangChain Text Splitters.
 - BeautifulSoup.
 - Pinecone Python SDK.
-- Required HTTP client for OpenRouter embeddings.
+- AWS SDK (`boto3`) for Amazon Bedrock embeddings.
 - Pydantic Settings or the existing application configuration system.
 
 Configure the following environment variables:
 
 ```
-OPENROUTER_API_KEY=
+AWS_REGION=eu-north-1
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+BEDROCK_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0
+EMBEDDING_DIMENSIONS=1024
 PINECONE_API_KEY=
 PINECONE_INDEX_NAME=financial-research
 ```
 
-Keep credentials in environment variables and never hardcode API keys.
+Keep credentials in environment variables and never hardcode API keys. Prefer the standard AWS credential chain when keys are not set explicitly.
 
 Create a centralised ingestion configuration for:
 
 - Markdown input directory.
 - Manifest location.
-- Embedding model.
+- Bedrock embedding model ID.
+- Embedding output dimensions (default 1024).
 - Embedding batch size.
 - Chunk size.
 - Chunk overlap.
 - Pinecone index name.
 - Company-to-namespace mapping.
 - Retry and timeout configuration.
+
+Do not require an embedding vector cache file or fingerprint resume store for Titan ingestion.
 
 ---
 
@@ -1957,27 +1966,30 @@ Generate a final chunking summary grouped by company and filing type.
 
 ---
 
-### 05 — Generate Vector Embeddings Using OpenRouter
+### 05 — Generate Vector Embeddings Using Amazon Bedrock Titan
 
 Convert all generated document chunks into numerical vector embeddings using the selected model:
 
-**Model:**`nvidia/llama-nemotron-embed-vl-1b-v2:free`
+**Model:** `amazon.titan-embed-text-v2:0`
 
-**OpenRouter Embeddings API:**`https://openrouter.ai/api/v1/embeddings`
+**Provider:** Amazon Bedrock (AWS SDK / `boto3`)
 
-Use the embedding endpoint, not the normal chat completion endpoint.
+**Default output dimensions:** `1024` (Titan V2 also supports `256` and `512`; pick one and use it consistently)
+
+Use Bedrock's Titan embedding API, not OpenRouter and not the chat completion endpoint.
 
 **Implementation Requirements**
 
-- Configure the OpenRouter API key securely.
-- Implement a reusable embedding client.
-- Implement a LangChain-compatible custom embedding adapter if required.
-- Generate embeddings for document chunks in batches.
-- Use the same embedding model for document embeddings and query embeddings.
-- Validate API responses and vector dimensions.
-- Handle rate limits, timeouts, temporary provider failures, and malformed responses.
-- Implement retry handling with appropriate backoff.
-- Avoid regenerating embeddings for unchanged documents when a reliable cache or ingestion fingerprint is available.
+- Configure AWS credentials and region securely (environment variables or the default AWS credential chain).
+- Enable Bedrock model access for Titan Embed Text V2 in the chosen region.
+- Implement a reusable Bedrock embedding client in `backend/ai/providers/bedrock_embeddings.py`.
+- Implement a LangChain-compatible embedding adapter with `embed_documents` and `embed_query`.
+- Generate embeddings for document chunks in batches in a single ingest run.
+- Use the **same** Titan model and dimensions for document embeddings and later query embeddings.
+- Validate API responses and vector dimensions against the configured dimension (default 1024).
+- Handle throttling, timeouts, temporary provider failures, and malformed responses with retries/backoff.
+- **Do not** implement an embedding cache, fingerprint store, or resume-from-disk layer for this path.
+- If an ingest run is interrupted, re-run ingestion; upserts keyed by stable chunk IDs may overwrite existing Pinecone vectors safely.
 
 #### Embedding Progress Logs
 
@@ -1988,7 +2000,8 @@ Example:
 ```
 Starting embedding generation...
 
-Model: nvidia/llama-nemotron-embed-vl-1b-v2:free
+Model: amazon.titan-embed-text-v2:0
+Dimensions: 1024
 
 Total chunks: 18,500
 
@@ -2000,12 +2013,10 @@ Embedding generation completed.
 
 Total successful embeddings: 18,500
 Failed embeddings: 0
-Vector dimensions: [determine from actual API response]
+Vector dimensions: 1024
 ```
 
-Do not hardcode the vector dimension without checking the actual embedding response.
-
-Ensure that the Pinecone index is configured with the same vector dimension returned by the selected embedding model.
+Ensure that the Pinecone index is configured with the same vector dimension returned by Titan (default 1024). Do not mix Titan vectors with embeddings from any other model in the same index.
 
 ---
 
@@ -2188,9 +2199,9 @@ Do not mark the phase complete until:
 
 1. All eligible Markdown documents have been processed or explicitly reported as failed/skipped.
 2. Chunks retain the correct company and filing metadata.
-3. Embeddings are generated successfully using the configured model.
+3. Embeddings are generated successfully using Amazon Bedrock Titan Embed Text V2 (`amazon.titan-embed-text-v2:0`) with consistent dimensions (default 1024), without an embedding cache layer.
 4. Each company's vectors are stored in its correct Pinecone namespace.
-5. Vector dimensions are consistent.
+5. Vector dimensions are consistent and match the Pinecone index.
 6. Retrieval works for all eight companies.
 7. Representative retrieval results contain the expected source documents and relevant financial information.
 8. All remaining failures and limitations are clearly reported.
@@ -2211,6 +2222,7 @@ Install the required dependencies where they are not already available:
 uv add langchain langchain-core langchain-openai
 uv add pinecone pinecone-text
 uv add sentence-transformers
+uv add boto3
 uv add guardrails-ai
 uv add mem0ai fastembed
 ```
@@ -2230,7 +2242,15 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
 OPENROUTER_CHAT_MODEL=nvidia/nemotron-3.5-super-vl:free
 
-OPENROUTER_EMBEDDING_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2:free
+AWS_REGION=eu-north-1
+
+AWS_ACCESS_KEY_ID=
+
+AWS_SECRET_ACCESS_KEY=
+
+BEDROCK_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0
+
+EMBEDDING_DIMENSIONS=1024
 
 PINECONE_API_KEY=
 
@@ -2249,7 +2269,7 @@ The values above are initial configuration defaults. Make them configurable rath
 
 Also centralize:
 
-- Embedding dimensions, determined at runtime.
+- Embedding dimensions (configured for Titan; validate against live responses).
 - Pinecone namespace mapping.
 - Hybrid search parameters.
 - Retrieval timeout.
@@ -2403,16 +2423,18 @@ A reusable OpenRouter chat model that can generate structured research plans, ca
 
 Ensure user questions are converted into embeddings using exactly the same embedding model and compatible configuration used during document ingestion.
 
-**Selected model: —** `nvidia/llama-nemotron-embed-vl-1b-v2:free`
+**Selected model: —** `amazon.titan-embed-text-v2:0` (Amazon Bedrock)
 
-Create: — `backend/ai/providers/openrouter_embeddings.py`
+**Default dimensions: —** `1024`
+
+Create: — `backend/ai/providers/bedrock_embeddings.py`
 
 Implement a custom LangChain-compatible embedding adapter.
 
 Required methods:
 
 ```
-class OpenRouterEmbeddings:
+class BedrockTitanEmbeddings:
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         ...
 
@@ -2420,32 +2442,29 @@ class OpenRouterEmbeddings:
         ...
 ```
 
-Implement the actual HTTP request through the OpenRouter embeddings endpoint:
-
-`https://openrouter.ai/api/v1/embeddings`
+Call Amazon Bedrock Titan Embed Text V2 through the AWS SDK (`boto3`), using the configured region, credentials, model ID, and output dimensions.
 
 Requirements:
 
-1. Use the configured OpenRouter API key.
-2. Use the exact model used during Phase 2 ingestion.
+1. Use the configured AWS credentials / credential chain and region.
+2. Use the exact Titan model and dimensions used during Phase 2 ingestion.
 3. Validate the number of vectors returned.
-4. Validate that each vector contains the expected number of dimensions.
-5. Handle request failures and rate limits.
-6. Support retry handling and timeouts.
+4. Validate that each vector contains the expected number of dimensions (default 1024).
+5. Handle request failures, throttling, and timeouts.
+6. Support retry handling with appropriate backoff.
 7. Preserve the input/output ordering.
-8. Use the appropriate query/document input mode if supported by the selected model and consistent with the ingestion configuration.
+8. Do not use OpenRouter, a free OpenRouter embedding model, or any other provider for query embeddings.
+9. Do not implement an embedding cache for query or document vectors.
 
-**Critical:** Do not introduce a new embedding model for queries. Using a different embedding space from the stored document vectors would make similarity retrieval unreliable.
+**Critical:** Do not introduce a different embedding model for queries. Using a different embedding space from the stored document vectors would make similarity retrieval unreliable.
 
-Check the existing Pinecone index dimension against the actual embedding response. Do not hardcode an assumed dimension.
+Check the existing Pinecone index dimension against the Titan response / configured dimensions. The index must match Titan (default 1024). Do not mix Titan vectors with vectors from another embedding model.
 
-OpenRouter documents the embeddings endpoint and supports embedding requests with single or multiple inputs.
-
-Documentation: https://openrouter.ai/docs/api/api-reference/embeddings/create-embeddings
+Documentation: Amazon Bedrock Titan Embed Text V2 model card / AWS Bedrock docs for `amazon.titan-embed-text-v2:0`
 
 **Deliverable**
 
-A reusable, tested embedding adapter for document-compatible query vectors.
+A reusable, tested Bedrock Titan embedding adapter for document-compatible query vectors.
 
 ---
 
@@ -2678,7 +2697,7 @@ Create:
 
 #### **9.1 — Dense Retrieval**
 
-Use the configured NVIDIA embedding model through OpenRouter to convert the investor question into a dense vector.
+Use the configured Amazon Bedrock Titan embedding model (`amazon.titan-embed-text-v2:0`) to convert the investor question into a dense vector. This must be the same model and dimension used during Phase 2 ingestion.
 
 Search the selected Pinecone namespace using:
 
